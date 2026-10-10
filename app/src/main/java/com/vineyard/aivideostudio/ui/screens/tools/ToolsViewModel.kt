@@ -775,8 +775,16 @@ class ToolsViewModel(
             return
         }
 
+        val state = _uiState.value
+        val activeFrameIndices = state.frames.map { it.index }.toSet()
         val allMatches = mutableListOf<DetectedTargetBox>()
-        for ((frameIdx, ocrData) in _uiState.value.extractedOcrData) {
+
+        for ((frameIdx, ocrData) in state.extractedOcrData) {
+            // Strictly scope clustering to the active extracted frames on screen
+            if (activeFrameIndices.isNotEmpty() && !activeFrameIndices.contains(frameIdx)) {
+                continue
+            }
+
             val boxes = SpatialClusterer.findMatchingBoundingBoxes(ocrData.lines, query)
             for (b in boxes) {
                 allMatches.add(
@@ -789,8 +797,8 @@ class ToolsViewModel(
             }
         }
 
-        val refW = _uiState.value.videoWidth
-        val refH = _uiState.value.videoHeight
+        val refW = state.videoWidth
+        val refH = state.videoHeight
         val clusters = SpatialClusterer.clusterBoxes(allMatches, refW, refH)
         _uiState.update { it.copy(detectedClusters = clusters) }
     }
@@ -828,38 +836,16 @@ class ToolsViewModel(
             _uiState.update { it.copy(statusText = "Locking Target Mask...", statusColorHex = "#eab308") }
             
             viewModelScope.launch(Dispatchers.Default) {
-                // Pass 1: Dynamically find the anchor frame and exact bounding box for the chosen cluster
-                var anchorFrame: ExtractedFrame? = null
-                var bestBox: ToolsBoundingBox? = null
-
-                if (clusterCenter != null) {
-                    for (frame in state.frames) {
-                        val ocr = state.extractedOcrData[frame.index]
-                        if (ocr != null) {
-                            val matches = SpatialClusterer.findMatchingBoundingBoxes(ocr.lines, keyword)
-                            val matchInCluster = matches.find { 
-                                hypot(it.centerX - clusterCenter.x, it.centerY - clusterCenter.y) <= clusterCenter.threshold 
-                            }
-                            if (matchInCluster != null) {
-                                anchorFrame = frame
-                                bestBox = matchInCluster
-                                break
-                            }
-                        }
-                    }
-                }
-
-                if (bestBox == null) {
-                    val fallbackFrame = state.frames.getOrNull(state.currentFrameIndex) ?: state.frames.first()
-                    anchorFrame = fallbackFrame
-                    val anchorOcr = state.extractedOcrData[fallbackFrame.index] ?: ocrEngine.scanFrame(fallbackFrame, roiMask = null)
-                    val targetMatches = SpatialClusterer.findMatchingBoundingBoxes(anchorOcr.lines, keyword)
-                    bestBox = if (clusterCenter != null) {
-                        targetMatches.find { hypot(it.centerX - clusterCenter.x, it.centerY - clusterCenter.y) <= clusterCenter.threshold }
-                            ?: targetMatches.firstOrNull()
-                    } else {
-                        targetMatches.firstOrNull()
-                    }
+                // Pass 1: Direct anchor lookup from the current or first active frame
+                val anchorFrame = state.frames.getOrNull(state.currentFrameIndex) ?: state.frames.first()
+                val anchorOcr = state.extractedOcrData[anchorFrame.index] ?: ocrEngine.scanFrame(anchorFrame, roiMask = null)
+                val targetMatches = SpatialClusterer.findMatchingBoundingBoxes(anchorOcr.lines, keyword)
+                
+                val bestBox: ToolsBoundingBox? = if (clusterCenter != null) {
+                    targetMatches.find { hypot(it.centerX - clusterCenter.x, it.centerY - clusterCenter.y) <= clusterCenter.threshold }
+                        ?: targetMatches.firstOrNull()
+                } else {
+                    targetMatches.firstOrNull()
                 }
 
                 // Pass 2: Programmatic Blackout Mask (Zero Drag)
@@ -877,24 +863,8 @@ class ToolsViewModel(
 
                 // Run batch scan with automated ROI mask in memory
                 val batchResults = ocrEngine.scanBatch(state.frames, roiMask = autoRoiMask, parallelWorkers = 5) { _, _ -> }
-                
-                // Merge masked results into master OCR map without destroying lines outside the mask
                 val updatedOcr = _uiState.value.extractedOcrData.toMutableMap()
-                for ((fIdx, batchOcr) in batchResults) {
-                    val existing = updatedOcr[fIdx]
-                    if (existing != null) {
-                        val outsideLines = existing.lines.filter { line ->
-                            autoRoiMask == null || 
-                            (line.bbox.x0 + line.bbox.width < autoRoiMask.x0 ||
-                             line.bbox.x0 > autoRoiMask.x0 + autoRoiMask.width ||
-                             line.bbox.y0 + line.bbox.height < autoRoiMask.y0 ||
-                             line.bbox.y0 > autoRoiMask.y0 + autoRoiMask.height)
-                        }
-                        updatedOcr[fIdx] = existing.copy(lines = outsideLines + batchOcr.lines)
-                    } else {
-                        updatedOcr[fIdx] = batchOcr
-                    }
-                }
+                updatedOcr.putAll(batchResults)
 
                 withContext(Dispatchers.Main) {
                     _uiState.update { it.copy(extractedOcrData = updatedOcr) }

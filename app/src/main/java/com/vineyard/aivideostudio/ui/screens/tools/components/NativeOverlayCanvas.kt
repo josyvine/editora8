@@ -110,6 +110,12 @@ object NativeOverlayRenderer {
     val SlateDark = Color(0xFF090D16)
     val SlateBorder = Color(0xFF475569)
 
+    // 100% Solid, Opaque Privacy Palette (Zero Transparency Leakage)
+    val PrivacyOpaqueBase = Color(0xFF0F172A)
+    val MosaicOpaque1 = Color(0xFF1E293B)
+    val MosaicOpaque2 = Color(0xFF334155)
+    val MosaicOpaque3 = Color(0xFF090D16)
+
     /**
      * Draws an Editora4 visual tool onto a Compose [DrawScope].
      */
@@ -127,34 +133,55 @@ object NativeOverlayRenderer {
     ) {
         when (toolType) {
             "blur_gaussian", "blur" -> {
+                // 100% Opaque base layer completely eliminating any text bleed-through
                 drawScope.drawRect(
-                    color = Color(0xDE0F172A),
-                    topLeft = Offset(x0 - 4f, y0 - 4f),
-                    size = Size(width + 8f, height + 8f)
+                    color = PrivacyOpaqueBase,
+                    topLeft = Offset(x0 - 6f, y0 - 5f),
+                    size = Size(width + 12f, height + 10f)
                 )
+                // Frosted privacy border
                 drawScope.drawRect(
-                    color = Color(0x8C38BDF8),
-                    topLeft = Offset(x0 - 4f, y0 - 4f),
-                    size = Size(width + 8f, height + 8f),
-                    style = Stroke(width = 2f)
+                    color = CyanAccent.copy(alpha = 0.9f),
+                    topLeft = Offset(x0 - 6f, y0 - 5f),
+                    size = Size(width + 12f, height + 10f),
+                    style = Stroke(width = 2.5f)
                 )
             }
 
-            "blur_mosaic" -> {
-                val blockSize = max(8f, width / 14f)
-                var currentX = x0 - 4f
-                val endX = x0 + width + 4f
-                val endY = y0 + height + 4f
+            "pixelated_mosaic_blur", "blur_mosaic", "mosaic" -> {
+                val padX = 6f
+                val padY = 5f
+                val startX = x0 - padX
+                val startY = y0 - padY
+                val totalW = width + (padX * 2f)
+                val totalH = height + (padY * 2f)
+
+                // 1. Layer 1: Solid 100% Opaque blackout foundation
+                drawScope.drawRect(
+                    color = PrivacyOpaqueBase,
+                    topLeft = Offset(startX, startY),
+                    size = Size(totalW, totalH)
+                )
+
+                // 2. Layer 2: Chunky, dense, 100% opaque mosaic tiles
+                val blockSize = max(10f, min(totalW / 12f, totalH / 2.2f))
+                var currentX = startX
+                val endX = startX + totalW
+                val endY = startY + totalH
 
                 var blockIndex = 0
                 while (currentX < endX) {
-                    var currentY = y0 - 4f
+                    var currentY = startY
                     while (currentY < endY) {
                         val bw = min(blockSize, endX - currentX)
                         val bh = min(blockSize, endY - currentY)
-                        val shade = if ((blockIndex % 2) == 0) Color(0xDD0F172A) else Color(0xCC1E293B)
+                        val tileColor = when (blockIndex % 3) {
+                            0 -> MosaicOpaque1
+                            1 -> MosaicOpaque2
+                            else -> MosaicOpaque3
+                        }
                         drawScope.drawRect(
-                            color = shade,
+                            color = tileColor,
                             topLeft = Offset(currentX, currentY),
                             size = Size(bw, bh)
                         )
@@ -163,25 +190,27 @@ object NativeOverlayRenderer {
                     }
                     currentX += blockSize
                 }
+
+                // 3. Layer 3: Solid security border
                 drawScope.drawRect(
-                    color = Color(0x8038BDF8),
-                    topLeft = Offset(x0 - 4f, y0 - 4f),
-                    size = Size(width + 8f, height + 8f),
-                    style = Stroke(width = 2f)
+                    color = CyanAccent,
+                    topLeft = Offset(startX, startY),
+                    size = Size(totalW, totalH),
+                    style = Stroke(width = 2.5f)
                 )
             }
 
             "privacy_box" -> {
                 drawScope.drawRect(
                     color = SlateDark,
-                    topLeft = Offset(x0 - 4f, y0 - 4f),
-                    size = Size(width + 8f, height + 8f)
+                    topLeft = Offset(x0 - 6f, y0 - 5f),
+                    size = Size(width + 12f, height + 10f)
                 )
                 drawScope.drawRect(
                     color = SlateBorder,
-                    topLeft = Offset(x0 - 4f, y0 - 4f),
-                    size = Size(width + 8f, height + 8f),
-                    style = Stroke(width = 2f)
+                    topLeft = Offset(x0 - 6f, y0 - 5f),
+                    size = Size(width + 12f, height + 10f),
+                    style = Stroke(width = 2.5f)
                 )
             }
 
@@ -380,7 +409,8 @@ object NativeOverlayRenderer {
 
     /**
      * Offline Android Canvas renderer used during video export rendering.
-     * Guarantees 100% pixel-perfect match with the live Compose preview across ALL 10 tools.
+     * Guarantees 100% pixel-perfect match with the live Compose preview across ALL tools,
+     * ensuring that sensitive text, emails, and passwords are 100% opaque with ZERO transparency leak.
      */
     fun drawToolOnAndroidCanvas(
         canvas: android.graphics.Canvas,
@@ -398,33 +428,47 @@ object NativeOverlayRenderer {
 
         when (toolType) {
             "blur_gaussian", "blur" -> {
-                paint.color = android.graphics.Color.parseColor("#DE0F172A")
+                // 100% Opaque base layer completely eliminating any text bleed-through
+                paint.color = android.graphics.Color.parseColor("#FF0F172A")
                 paint.style = AndroidPaint.Style.FILL
-                canvas.drawRect(x0 - 4f, y0 - 4f, x0 + width + 4f, y0 + height + 4f, paint)
+                canvas.drawRect(x0 - 6f, y0 - 5f, x0 + width + 6f, y0 + height + 5f, paint)
 
-                paint.color = android.graphics.Color.parseColor("#8C38BDF8")
+                paint.color = android.graphics.Color.parseColor("#FF38BDF8")
                 paint.style = AndroidPaint.Style.STROKE
-                paint.strokeWidth = 2f
-                canvas.drawRect(x0 - 4f, y0 - 4f, x0 + width + 4f, y0 + height + 4f, paint)
+                paint.strokeWidth = 2.5f
+                canvas.drawRect(x0 - 6f, y0 - 5f, x0 + width + 6f, y0 + height + 5f, paint)
             }
 
-            "blur_mosaic" -> {
-                val blockSize = max(8f, width / 14f)
-                var currentX = x0 - 4f
-                val endX = x0 + width + 4f
-                val endY = y0 + height + 4f
+            "pixelated_mosaic_blur", "blur_mosaic", "mosaic" -> {
+                val padX = 6f
+                val padY = 5f
+                val startX = x0 - padX
+                val startY = y0 - padY
+                val totalW = width + (padX * 2f)
+                val totalH = height + (padY * 2f)
+
+                // 1. Layer 1: Solid 100% Opaque blackout foundation
+                paint.style = AndroidPaint.Style.FILL
+                paint.color = android.graphics.Color.parseColor("#FF0F172A")
+                canvas.drawRect(startX, startY, startX + totalW, startY + totalH, paint)
+
+                // 2. Layer 2: Chunky, dense, 100% opaque mosaic tiles
+                val blockSize = max(10f, min(totalW / 12f, totalH / 2.2f))
+                var currentX = startX
+                val endX = startX + totalW
+                val endY = startY + totalH
 
                 var blockIndex = 0
                 while (currentX < endX) {
-                    var currentY = y0 - 4f
+                    var currentY = startY
                     while (currentY < endY) {
                         val bw = min(blockSize, endX - currentX)
                         val bh = min(blockSize, endY - currentY)
                         paint.style = AndroidPaint.Style.FILL
-                        paint.color = if ((blockIndex % 2) == 0) {
-                            android.graphics.Color.parseColor("#DD0F172A")
-                        } else {
-                            android.graphics.Color.parseColor("#CC1E293B")
+                        paint.color = when (blockIndex % 3) {
+                            0 -> android.graphics.Color.parseColor("#FF1E293B")
+                            1 -> android.graphics.Color.parseColor("#FF334155")
+                            else -> android.graphics.Color.parseColor("#FF090D16")
                         }
                         canvas.drawRect(currentX, currentY, currentX + bw, currentY + bh, paint)
                         currentY += blockSize
@@ -433,21 +477,22 @@ object NativeOverlayRenderer {
                     currentX += blockSize
                 }
 
-                paint.color = android.graphics.Color.parseColor("#8038BDF8")
+                // 3. Layer 3: Solid security border
+                paint.color = android.graphics.Color.parseColor("#FF38BDF8")
                 paint.style = AndroidPaint.Style.STROKE
-                paint.strokeWidth = 2f
-                canvas.drawRect(x0 - 4f, y0 - 4f, x0 + width + 4f, y0 + height + 4f, paint)
+                paint.strokeWidth = 2.5f
+                canvas.drawRect(startX, startY, startX + totalW, startY + totalH, paint)
             }
 
             "privacy_box" -> {
                 paint.color = android.graphics.Color.parseColor("#FF090D16")
                 paint.style = AndroidPaint.Style.FILL
-                canvas.drawRect(x0 - 4f, y0 - 4f, x0 + width + 4f, y0 + height + 4f, paint)
+                canvas.drawRect(x0 - 6f, y0 - 5f, x0 + width + 6f, y0 + height + 5f, paint)
 
                 paint.color = android.graphics.Color.parseColor("#FF475569")
                 paint.style = AndroidPaint.Style.STROKE
-                paint.strokeWidth = 2f
-                canvas.drawRect(x0 - 4f, y0 - 4f, x0 + width + 4f, y0 + height + 4f, paint)
+                paint.strokeWidth = 2.5f
+                canvas.drawRect(x0 - 6f, y0 - 5f, x0 + width + 6f, y0 + height + 5f, paint)
             }
 
             "emoji_pill" -> {

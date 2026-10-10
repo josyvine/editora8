@@ -1727,7 +1727,7 @@ class ToolsViewModel(
                 var muxerStarted = false
 
                 val bufferInfo = MediaCodec.BufferInfo()
-                val frameDurationUs = (1_000_000L / fps)
+                var encodedFrameCount = 0L
 
                 val workspaceDir = File(context.filesDir, "editora_frames_workspace")
                 streamRetriever = MediaMetadataRetriever().apply {
@@ -1735,19 +1735,26 @@ class ToolsViewModel(
                 }
 
                 val destRect = Rect(0, 0, outWidth, outHeight)
+                var lastValidFrameBitmap: Bitmap? = null
 
                 for (i in 0 until totalVideoFrames) {
-                    val ptsUs = i * frameDurationUs
-                    val targetTimeUs = ptsUs
+                    val targetTimeUs = (i * 1_000_000L) / fps
 
                     // Load frame: from workspace cache if available, or decode from stream
                     val frameFile = File(workspaceDir, "frame_$i.jpg")
-                    val frameBitmap = if (frameFile.exists()) {
+                    val currentBitmap = if (frameFile.exists()) {
                         BitmapFactory.decodeFile(frameFile.absolutePath)
                     } else {
                         streamRetriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                             ?: streamRetriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                    } ?: continue
+                    }
+
+                    if (currentBitmap != null) {
+                        lastValidFrameBitmap?.recycle()
+                        lastValidFrameBitmap = currentBitmap
+                    }
+
+                    val frameBitmap = currentBitmap ?: lastValidFrameBitmap ?: continue
 
                     val surfaceCanvas: Canvas? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                         inputSurface.lockHardwareCanvas()
@@ -1777,7 +1784,7 @@ class ToolsViewModel(
                                     width = bw,
                                     height = bh,
                                     toolType = box.tool,
-                                    currentTimeMs = (i * (1000f / fps)).toLong(),
+                                    currentTimeMs = (i * 1000L) / fps,
                                     withArrow = state.isArrowPointerEnabled
                                 )
                             }
@@ -1786,9 +1793,11 @@ class ToolsViewModel(
                         }
                     }
 
-                    frameBitmap.recycle()
+                    if (currentBitmap != null && currentBitmap != lastValidFrameBitmap) {
+                        currentBitmap.recycle()
+                    }
 
-                    // Drain encoder output buffers properly handling INFO_OUTPUT_FORMAT_CHANGED
+                    // Drain encoder output buffers properly setting explicit synthetic presentation timestamps (PTS)
                     while (true) {
                         val outIndex = encoder.dequeueOutputBuffer(bufferInfo, 2500)
                         if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
@@ -1798,10 +1807,12 @@ class ToolsViewModel(
                                 muxerStarted = true
                             }
                         } else if (outIndex >= 0) {
-                            if (muxerStarted && bufferInfo.size > 0) {
+                            if (muxerStarted && bufferInfo.size > 0 && (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0)) {
                                 val encodedData = encoder.getOutputBuffer(outIndex)
                                 if (encodedData != null) {
+                                    bufferInfo.presentationTimeUs = (encodedFrameCount * 1_000_000L) / fps
                                     videoMuxer.writeSampleData(videoTrackIndex, encodedData, bufferInfo)
+                                    encodedFrameCount++
                                 }
                             }
                             encoder.releaseOutputBuffer(outIndex, false)
@@ -1818,7 +1829,7 @@ class ToolsViewModel(
                     updateBackgroundKeepAlive(i + 1, totalVideoFrames)
                 }
 
-                // Final EOS drain
+                // Final EOS drain with synthetic PTS to guarantee exact audio duration synchronization
                 encoder.signalEndOfInputStream()
                 while (true) {
                     val outIndex = encoder.dequeueOutputBuffer(bufferInfo, 10000)
@@ -1829,10 +1840,12 @@ class ToolsViewModel(
                             muxerStarted = true
                         }
                     } else if (outIndex >= 0) {
-                        if (muxerStarted && bufferInfo.size > 0) {
+                        if (muxerStarted && bufferInfo.size > 0 && (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0)) {
                             val encodedData = encoder.getOutputBuffer(outIndex)
                             if (encodedData != null) {
+                                bufferInfo.presentationTimeUs = (encodedFrameCount * 1_000_000L) / fps
                                 videoMuxer.writeSampleData(videoTrackIndex, encodedData, bufferInfo)
+                                encodedFrameCount++
                             }
                         }
                         encoder.releaseOutputBuffer(outIndex, false)
@@ -1841,6 +1854,9 @@ class ToolsViewModel(
                         break
                     }
                 }
+
+                lastValidFrameBitmap?.recycle()
+                lastValidFrameBitmap = null
 
                 try { encoder.stop() } catch (_: Exception) {}
                 try { encoder.release() } catch (_: Exception) {}
@@ -1876,7 +1892,7 @@ class ToolsViewModel(
                         statusText = "Full Video Downloaded",
                         statusColorHex = "#10b981"
                     )}
-                    addLog("🎉 SUCCESS: Full video rendered with all accumulated cue highlights and audio.", LogType.SUCCESS)
+                    addLog("🎉 SUCCESS: Full video rendered with all accumulated cue highlights and audio at normal speed.", LogType.SUCCESS)
                     stopBackgroundKeepAlive()
                 }
 

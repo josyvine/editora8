@@ -351,10 +351,10 @@ class ToolsViewModel(
         _uiState.update { it.copy(
             isProcessing = true, 
             targetFps = targetFps,
-            statusText = "Extracting...", 
+            statusText = "Turbo Extracting...", 
             statusColorHex = "#eab308"
         ) }
-        addLog("⚡ Starting IDM-style 10-stream parallel hardware frame extraction (100 frames/batch) at $targetFps FPS...", LogType.INFO)
+        addLog("⚡ Starting High-Speed Hardware Frame Extraction across 10 streams at $targetFps FPS...", LogType.INFO)
         startBackgroundKeepAlive("Extracting video frames in background...")
 
         extractionJob?.cancel()
@@ -397,7 +397,7 @@ class ToolsViewModel(
 
                         val now = System.currentTimeMillis()
                         val last = lastUiDispatchMs.get()
-                        if (now - last > 80 || doneInWorker >= totalInWorker) {
+                        if (now - last > 35 || doneInWorker >= totalInWorker) {
                             if (lastUiDispatchMs.compareAndSet(last, now)) {
                                 _uiState.update { state ->
                                     state.copy(workerTasks = taskMap.values.sortedBy { it.taskId })
@@ -408,7 +408,7 @@ class ToolsViewModel(
                     onTotalProgress = { current, total ->
                         val pct = if (total > 0) ((current.toFloat() / total.toFloat()) * 100).toInt() else 0
                         _uiState.update { it.copy(
-                            statusText = "Extracting $current/$total",
+                            statusText = "Hardware Decoding $current/$total",
                             progressPercent = pct,
                             workerTasks = taskMap.values.sortedBy { it.taskId }
                         )}
@@ -425,7 +425,7 @@ class ToolsViewModel(
                         progressPercent = 0,
                         workerTasks = emptyList()
                     )}
-                    addLog("✅ Successfully extracted ${extractedList.size} frames via 10 concurrent worker streams.", LogType.SUCCESS)
+                    addLog("✅ Successfully extracted ${extractedList.size} frames via Turbo Hardware Decoding.", LogType.SUCCESS)
                     stopBackgroundKeepAlive()
                 }
             } catch (e: Exception) {
@@ -497,7 +497,7 @@ class ToolsViewModel(
 
         viewModelScope.launch(Dispatchers.Default) {
             try {
-                // 1. Extract the selective frame range
+                // 1. Extract the selective frame range with single-keyframe hardware seeking
                 val extractedList = frameExtractor.extractFrameRange(
                     videoUri = uri,
                     startFrame = startF,

@@ -939,10 +939,10 @@ class ToolsViewModel(
         val blurMap = state.directBlurs.toMutableMap()
         val accumMap = state.accumulatedDirectBlurs.toMutableMap()
 
-        val updatedFrames = state.frames.map { f ->
+        // Pass 1: Collect direct OCR matches on each active frame
+        val directMatchMap = mutableMapOf<Int, List<DetectedTargetBox>>()
+        for (f in state.frames) {
             val ocr = state.extractedOcrData[f.index]
-            var hasMatch = false
-
             if (ocr != null) {
                 val frameBoxes = mutableListOf<DetectedTargetBox>()
                 for (rule in state.activeRules) {
@@ -955,7 +955,6 @@ class ToolsViewModel(
                             }
                         }
 
-                        hasMatch = true
                         frameBoxes.add(
                             DetectedTargetBox(
                                 x0 = b.x0,
@@ -971,14 +970,52 @@ class ToolsViewModel(
                     }
                 }
                 if (frameBoxes.isNotEmpty()) {
-                    blurMap[f.index] = frameBoxes
-                    accumMap[f.index] = frameBoxes
-                } else if (!state.activeRules.any { it.isZipSource }) {
-                    blurMap.remove(f.index)
+                    directMatchMap[f.index] = frameBoxes
                 }
             }
-            if (hasMatch) f.copy(isHighlightEnabled = true, hasMismatch = false) else f.copy(isHighlightEnabled = false)
         }
+
+        // Pass 2: Temporal Safety Persistence Bridge (+2 Trailing Frames Hold)
+        // Eliminates single-frame OCR drops on exit transitions in Normal Mode and boundary lag in Cue Mode
+        var consecutiveMatchCount = 0
+        var lastConfirmedBoxes: List<DetectedTargetBox>? = null
+        var trailingHoldRemaining = 0
+        val maxTrailingHoldFrames = 2
+
+        val updatedFrames = state.frames.map { f ->
+            val directMatches = directMatchMap[f.index]
+            val finalBoxes: List<DetectedTargetBox>
+
+            if (!directMatches.isNullOrEmpty()) {
+                consecutiveMatchCount++
+                lastConfirmedBoxes = directMatches
+                trailingHoldRemaining = maxTrailingHoldFrames
+                finalBoxes = directMatches
+            } else if (consecutiveMatchCount >= 2 && lastConfirmedBoxes != null && trailingHoldRemaining > 0) {
+                // Confirmed sequence encountered an exit transition or dropped frame: hold blur
+                trailingHoldRemaining--
+                finalBoxes = lastConfirmedBoxes!!.map { box ->
+                    box.copy(frame = f.index, time = f.timeSeconds)
+                }
+            } else {
+                consecutiveMatchCount = 0
+                lastConfirmedBoxes = null
+                trailingHoldRemaining = 0
+                finalBoxes = emptyList()
+            }
+
+            if (finalBoxes.isNotEmpty()) {
+                blurMap[f.index] = finalBoxes
+                accumMap[f.index] = finalBoxes
+                f.copy(isHighlightEnabled = true, hasMismatch = false)
+            } else {
+                if (!state.activeRules.any { it.isZipSource }) {
+                    blurMap.remove(f.index)
+                }
+                f.copy(isHighlightEnabled = false)
+            }
+        }
+
         _uiState.update { it.copy(frames = updatedFrames, directBlurs = blurMap, accumulatedDirectBlurs = accumMap) }
         updateExportedJsonState()
     }

@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
+import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.media.Image
@@ -21,7 +22,6 @@ import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.nio.ByteBuffer
 import java.util.Locale
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -54,14 +54,13 @@ data class WorkerInitInfo(
 
 /**
  * High-performance, hardware-accelerated native frame extraction engine.
- * Leverages sequential MediaCodec hardware decoding with IDM multi-stream progress reporting.
+ * Leverages sequential MediaCodec hardware decoding with IDM multi-stream progress reporting
+ * and automatic container rotation normalization.
  */
 class FastNativeFrameExtractor(private val context: Context) {
 
     /**
      * Sequential Hardware Extraction with 10-Stream IDM Progress Callbacks.
-     * Streams video frames monotonically through the phone's dedicated hardware decoder
-     * while reporting real-time progress across all 10 worker streams.
      */
     suspend fun extractFramesWithWorkers(
         videoUri: Uri,
@@ -111,7 +110,6 @@ class FastNativeFrameExtractor(private val context: Context) {
         val totalFrames = floor(durationSec * targetFps).toInt()
         if (totalFrames <= 0) return@withContext emptyList()
 
-        // Partition into 10 worker stream tasks for the UI
         val workerCount = 10
         val chunkSize = ceil(totalFrames.toFloat() / workerCount.toFloat()).toInt()
 
@@ -131,7 +129,7 @@ class FastNativeFrameExtractor(private val context: Context) {
             onInitWorkers(workerInitList)
         }
 
-        // Try sequential hardware decoding via MediaCodec first
+        // Try sequential hardware decoding via MediaCodec
         val hardwareResult = tryExtractWithMediaCodec(
             videoUri = videoUri,
             targetFps = targetFps,
@@ -139,6 +137,7 @@ class FastNativeFrameExtractor(private val context: Context) {
             chunkSize = chunkSize,
             workerInitList = workerInitList,
             workspaceDir = workspaceDir,
+            rotation = rotation,
             onWorkerProgress = onWorkerProgress,
             onTotalProgress = onTotalProgress
         )
@@ -150,7 +149,7 @@ class FastNativeFrameExtractor(private val context: Context) {
             return@withContext hardwareResult
         }
 
-        // Resilient fallback to MediaMetadataRetriever if hardware codec is unavailable
+        // Fallback to MediaMetadataRetriever if needed
         return@withContext fallbackExtractWithRetriever(
             videoUri = videoUri,
             targetFps = targetFps,
@@ -176,6 +175,7 @@ class FastNativeFrameExtractor(private val context: Context) {
         chunkSize: Int,
         workerInitList: List<WorkerInitInfo>,
         workspaceDir: File,
+        rotation: Int,
         onWorkerProgress: (taskId: Int, doneInWorker: Int, totalInWorker: Int) -> Unit,
         onTotalProgress: (current: Int, total: Int) -> Unit
     ): List<ExtractedFrame> {
@@ -229,7 +229,6 @@ class FastNativeFrameExtractor(private val context: Context) {
             val workerDoneMap = IntArray(workerInitList.size) { 0 }
 
             while (!isEosOutput && nextTargetFrameIndex < totalFrames) {
-                // Feed input samples to decoder
                 if (!isEosInput) {
                     val inIndex = decoder.dequeueInputBuffer(5000)
                     if (inIndex >= 0) {
@@ -248,7 +247,6 @@ class FastNativeFrameExtractor(private val context: Context) {
                     }
                 }
 
-                // Dequeue decoded output frames
                 val outIndex = decoder.dequeueOutputBuffer(bufferInfo, 5000)
                 if (outIndex >= 0) {
                     if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
@@ -258,19 +256,17 @@ class FastNativeFrameExtractor(private val context: Context) {
                     val targetTimeUs = nextTargetFrameIndex * intervalUs
                     val pts = bufferInfo.presentationTimeUs
 
-                    // Check if this decoded frame matches our target interval
                     if (pts >= targetTimeUs - (intervalUs / 2) && bufferInfo.size > 0) {
                         val outputImage = decoder.getOutputImage(outIndex)
                         if (outputImage != null) {
                             val frameFile = File(workspaceDir, "frame_$nextTargetFrameIndex.jpg")
-                            val saved = saveImageAsJpeg(outputImage, frameFile)
+                            val saved = saveImageAsJpeg(outputImage, frameFile, rotation)
                             outputImage.close()
 
                             if (saved && frameFile.exists()) {
                                 val timeSec = targetTimeUs / 1_000_000f
                                 val timeFormatted = String.format(Locale.US, "%.2f", timeSec)
 
-                                // Create lightweight thumbnail
                                 val thumbBitmap = decodeSmallThumb(frameFile)
 
                                 extractedFrames.add(
@@ -283,7 +279,6 @@ class FastNativeFrameExtractor(private val context: Context) {
                                     )
                                 )
 
-                                // Update 10-stream progress for the UI
                                 val currentWorkerIdx = (nextTargetFrameIndex / chunkSize).coerceIn(0, workerInitList.size - 1)
                                 workerDoneMap[currentWorkerIdx]++
                                 val workerInfo = workerInitList[currentWorkerIdx]
@@ -433,7 +428,6 @@ class FastNativeFrameExtractor(private val context: Context) {
 
     /**
      * Selective Frame Range Extraction for Audio Cue Sync Mode.
-     * Uses fast hardware seeking to extract frames between [startFrame] and [endFrame] in ~100-200ms.
      */
     suspend fun extractFrameRange(
         videoUri: Uri,
@@ -520,12 +514,34 @@ class FastNativeFrameExtractor(private val context: Context) {
     }
 
     /**
-     * Converts a raw YUV_420_888 MediaCodec output image directly to JPEG without intermediate full Bitmap allocation.
+     * Converts a raw YUV_420_888 MediaCodec output image directly to JPEG,
+     * rotating by [rotation] degrees so vertical videos are never displayed sideways.
      */
-    private fun saveImageAsJpeg(image: Image, outputFile: File): Boolean {
+    private fun saveImageAsJpeg(image: Image, outputFile: File, rotation: Int): Boolean {
         return try {
             val nv21Bytes = yuv420888ToNv21(image)
             val yuvImage = YuvImage(nv21Bytes, ImageFormat.NV21, image.width, image.height, null)
+
+            if (rotation == 90 || rotation == 180 || rotation == 270) {
+                val baos = ByteArrayOutputStream()
+                yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 75, baos)
+                val rawBytes = baos.toByteArray()
+
+                val rawBitmap = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size)
+                if (rawBitmap != null) {
+                    val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
+                    val rotatedBitmap = Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true)
+                    rawBitmap.recycle()
+
+                    BufferedOutputStream(FileOutputStream(outputFile), 65536).use { fos ->
+                        rotatedBitmap.compress(Bitmap.CompressFormat.JPEG, 75, fos)
+                    }
+                    rotatedBitmap.recycle()
+                    return true
+                }
+            }
+
+            // Normal unrotated orientation
             BufferedOutputStream(FileOutputStream(outputFile), 65536).use { fos ->
                 yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 75, fos)
             }

@@ -1144,7 +1144,7 @@ class ToolsViewModel(
                     put("contents", JSONArray().put(JSONObject().apply {
                         put("parts", JSONArray().apply {
                             put(JSONObject().apply {
-                                put("text", "Listen to this audio track. Transcribe all spoken speech accurately. Output a JSON array of speech segments where each object has: \"start\" (start time in seconds as a float number), \"end\" (end time in seconds as a float number), and \"text\" (exact spoken words string). Example format: [{\"start\": 3.2, \"end\": 4.8, \"text\": \"click on playground\"}].")
+                                put("text", "Listen to this audio track. Transcribe all spoken speech accurately. Output a JSON array of speech segments where each object has: \"start\" (exact total elapsed time in seconds as a float, e.g. 1 minute 22 seconds is 82.2, 3 minutes 44 seconds is 224.4, NEVER write 344 or minutes as hundreds), \"end\" (total elapsed seconds as a float), and \"text\" (exact spoken words string). Example format: [{\"start\": 3.2, \"end\": 4.8, \"text\": \"click on playground\"}].")
                             })
                             put(JSONObject().apply {
                                 put("inlineData", JSONObject().apply {
@@ -1695,10 +1695,8 @@ class ToolsViewModel(
                 val allHighlightsMap = state.accumulatedDirectBlurs.toMutableMap()
                 allHighlightsMap.putAll(state.directBlurs)
 
-                // Ensure totalVideoFrames covers all locked cue highlights without early truncation
-                val maxHighlightFrame = (allHighlightsMap.keys.maxOrNull() ?: 0) + 1
-                val totalVideoFrames = max(if (durationSec > 0f) floor(durationSec * fps).toInt() else state.frames.size, maxHighlightFrame)
-                if (totalVideoFrames <= 0) throw IllegalStateException("Could not determine total video frame count.")
+                // Video duration is strictly bound to original video length (prevents stretching to 5:48)
+                val totalVideoFrames = max(1, if (durationSec > 0f) floor(durationSec * fps).toInt() else state.frames.size)
 
                 val workspaceDir = File(context.filesDir, "editora_frames_workspace")
                 if (!workspaceDir.exists()) {
@@ -1736,7 +1734,7 @@ class ToolsViewModel(
                 for (i in 0 until totalVideoFrames) {
                     val targetTimeUs = (i * 1_000_000L) / fps
 
-                    // Load frame from workspace cache or retrieve via hardware scaler
+                    // Load frame from workspace cache first, or hardware scaled retriever fallback
                     val frameFile = File(workspaceDir, "frame_$i.jpg")
                     val currentBitmap = if (frameFile.exists()) {
                         BitmapFactory.decodeFile(frameFile.absolutePath)
@@ -1765,6 +1763,7 @@ class ToolsViewModel(
 
                     if (surfaceCanvas != null) {
                         try {
+                            // Draw base video frame scaled 100% to fill the encoder canvas
                             surfaceCanvas.drawBitmap(frameBitmap, null, destRect, null)
 
                             val boxes = allHighlightsMap[i] ?: emptyList()

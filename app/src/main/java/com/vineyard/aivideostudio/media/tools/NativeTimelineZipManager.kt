@@ -252,6 +252,16 @@ object NativeTimelineZipManager {
     }
 
     /**
+     * Universal normalizer for Gemini timestamps formatted as pseudo-minutes (e.g. 344.42 -> 224.42s).
+     */
+    private fun normalizeTimestamp(rawTime: Double): Float {
+        if (rawTime < 60.0) return rawTime.toFloat()
+        val minutes = floor(rawTime / 100.0)
+        val seconds = rawTime % 100.0
+        return ((minutes * 60.0) + seconds).toFloat()
+    }
+
+    /**
      * Parses transcripts in JSON, SRT, VTT, or timestamped plain-text formats.
      */
     fun parseTranscript(rawText: String): List<AudioCueSegment> {
@@ -275,9 +285,13 @@ object NativeTimelineZipManager {
 
                 for (i in 0 until jsonArr.length()) {
                     val item = jsonArr.getJSONObject(i)
-                    val start = item.optDouble("start", item.optDouble("time", 0.0)).toFloat()
-                    val end = item.optDouble("end", (start + 2.0)).toFloat()
+                    val rawStart = item.optDouble("start", item.optDouble("time", 0.0))
+                    val rawEnd = item.optDouble("end", rawStart + 2.0)
+                    
+                    val start = normalizeTimestamp(rawStart)
+                    val end = normalizeTimestamp(rawEnd)
                     val text = item.optString("text", item.optString("words", "")).trim()
+                    
                     if (text.isNotEmpty()) {
                         results.add(AudioCueSegment(start = start, end = end, text = text))
                     }
@@ -326,13 +340,14 @@ object NativeTimelineZipManager {
             if (matcher.matches()) {
                 val timeStr = matcher.group(1) ?: continue
                 val text = matcher.group(2)?.trim() ?: ""
-                val t = if (timeStr.contains(":")) {
+                val rawT = if (timeStr.contains(":")) {
                     val parts = timeStr.split(":")
-                    (parts.getOrNull(0)?.toFloatOrNull() ?: 0f) * 60f +
-                            (parts.getOrNull(1)?.toFloatOrNull() ?: 0f)
+                    (parts.getOrNull(0)?.toDoubleOrNull() ?: 0.0) * 60.0 +
+                            (parts.getOrNull(1)?.toDoubleOrNull() ?: 0.0)
                 } else {
-                    timeStr.toFloatOrNull() ?: 0f
+                    timeStr.toDoubleOrNull() ?: 0.0
                 }
+                val t = normalizeTimestamp(rawT)
                 if (text.isNotEmpty()) {
                     results.add(AudioCueSegment(start = t, end = t + 2.0f, text = text))
                 }

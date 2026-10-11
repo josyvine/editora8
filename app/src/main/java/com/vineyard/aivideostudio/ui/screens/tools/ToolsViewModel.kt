@@ -445,8 +445,7 @@ class ToolsViewModel(
 
     /**
      * Extracts ONLY the selective frame range for the chosen Audio Cue.
-     * When a keyword is provided, narrows start and end frames proportionally;
-     * when empty, extracts the full dialogue window with safe buffers.
+     * Includes +2 extra trailing buffer frames to guarantee 100% boundary privacy coverage.
      */
     fun extractCueFrames() {
         val state = _uiState.value
@@ -477,15 +476,15 @@ class ToolsViewModel(
             val cueStartSec = cue.startFrame.toFloat() / fps
 
             val subStartSec = maxOf(0f, cueStartSec + (startCharIdx.toFloat() / totalChars) * cueDuration - 0.25f)
-            val subEndSec = cueStartSec + (endCharIdx.toFloat() / totalChars) * cueDuration + 0.35f
+            val subEndSec = cueStartSec + (endCharIdx.toFloat() / totalChars) * cueDuration + 0.45f
 
             startF = floor(subStartSec * fps).toInt().coerceAtLeast(0)
-            endF = ceil(subEndSec * fps).toInt().coerceAtLeast(startF + 1)
+            endF = ceil(subEndSec * fps).toInt().coerceAtLeast(startF + 1) + 2
             addLog("🎯 Keyword '$keyword' narrowed dialogue window to Fr $startF - $endF (~${endF - startF + 1} frames).", LogType.INFO)
         } else {
             val bufferFrames = maxOf(2, (0.25f * fps).toInt())
             startF = maxOf(0, cue.startFrame - bufferFrames)
-            endF = cue.endFrame + bufferFrames
+            endF = cue.endFrame + bufferFrames + 2
             addLog("🎯 Extracting full dialogue window: Fr $startF - $endF (~${endF - startF + 1} frames).", LogType.INFO)
         }
 
@@ -512,7 +511,7 @@ class ToolsViewModel(
                     }
                 )
 
-                // 2. Automatically run ultra-fast initial OCR to detect anchor
+                // 2. Automatically run ultra-fast initial OCR on the full cue frames
                 _uiState.update { it.copy(statusText = "Scanning Text...", statusColorHex = "#eab308") }
                 val ocrBatch = ocrEngine.scanBatch(extractedList, roiMask = null, parallelWorkers = 5) { _, _ -> }
                 val updatedOcr = _uiState.value.extractedOcrData.toMutableMap()
@@ -611,7 +610,6 @@ class ToolsViewModel(
 
         val state = _uiState.value
         if (state.studioMode == "Cue") {
-            // In Cue mode, do not trigger the SlotCaptureDialog popup modal
             _uiState.update { it.copy(isPlaying = false) }
             return
         }
@@ -804,9 +802,9 @@ class ToolsViewModel(
     }
 
     /**
-     * Programmatic Target Locking with Automated Black Screen Mask (Zero Drag):
-     * Locates the exact target phrase on screen, programmatically applies an ROI mask
-     * to blackout all surrounding headers and unrelated elements, and locks pulsing brackets.
+     * Programmatic Target Locking:
+     * Appends the new rule to support multiple simultaneous targets on the same timeline,
+     * without erasing the master OCR memory or deleting previous rules.
      */
     fun addTargetRule(keyword: String, category: String, tool: String, clusterId: String = "all") {
         if (keyword.isBlank()) return
@@ -828,54 +826,25 @@ class ToolsViewModel(
             clusterCenter = clusterCenter
         )
 
-        // Enforce single active target rule to prevent overlapping duplicates
-        _uiState.update { it.copy(activeRules = listOf(newRule)) }
-
+        // Support multiple simultaneous target rules on the same timeline
         val state = _uiState.value
+        val updatedRules = state.activeRules.filter { it.text.lowercase() != newRule.text.lowercase() }.toMutableList()
+        updatedRules.add(newRule)
+        _uiState.update { it.copy(activeRules = updatedRules) }
+
         if (state.frames.isNotEmpty()) {
-            _uiState.update { it.copy(statusText = "Locking Target Mask...", statusColorHex = "#eab308") }
+            _uiState.update { it.copy(statusText = "Locking Target...", statusColorHex = "#eab308") }
             
             viewModelScope.launch(Dispatchers.Default) {
-                // Pass 1: Direct anchor lookup from the current or first active frame
-                val anchorFrame = state.frames.getOrNull(state.currentFrameIndex) ?: state.frames.first()
-                val anchorOcr = state.extractedOcrData[anchorFrame.index] ?: ocrEngine.scanFrame(anchorFrame, roiMask = null)
-                val targetMatches = SpatialClusterer.findMatchingBoundingBoxes(anchorOcr.lines, keyword)
-                
-                val bestBox: ToolsBoundingBox? = if (clusterCenter != null) {
-                    targetMatches.find { hypot(it.centerX - clusterCenter.x, it.centerY - clusterCenter.y) <= clusterCenter.threshold }
-                        ?: targetMatches.firstOrNull()
-                } else {
-                    targetMatches.firstOrNull()
-                }
-
-                // Pass 2: Programmatic Blackout Mask (Zero Drag)
-                // Cuts out ONLY the target box (+ padding) and blacks out 100% of the surrounding screen
-                val autoRoiMask: ToolsBoundingBox? = if (bestBox != null) {
-                    val padX = 40f
-                    val padY = 25f
-                    ToolsBoundingBox(
-                        x0 = maxOf(0f, bestBox.x0 - padX),
-                        y0 = maxOf(0f, bestBox.y0 - padY),
-                        width = bestBox.width + (padX * 2f),
-                        height = bestBox.height + (padY * 2f)
-                    )
-                } else null
-
-                // Run batch scan with automated ROI mask in memory
-                val batchResults = ocrEngine.scanBatch(state.frames, roiMask = autoRoiMask, parallelWorkers = 5) { _, _ -> }
-                val updatedOcr = _uiState.value.extractedOcrData.toMutableMap()
-                updatedOcr.putAll(batchResults)
-
+                // Instantly re-evaluate all active rules without destroying the master full-screen OCR map
+                evaluateHighlightMatches()
                 withContext(Dispatchers.Main) {
-                    _uiState.update { it.copy(extractedOcrData = updatedOcr) }
-                    updateTargetClusters(keyword)
-                    evaluateHighlightMatches()
                     val matchCount = _uiState.value.frames.count { it.isHighlightEnabled }
                     _uiState.update { it.copy(
                         statusText = if (matchCount > 0) "Locked: $matchCount Frames" else "Target Locked",
                         statusColorHex = "#10b981"
                     )}
-                    addLog("🎯 Target '$keyword' masked & locked on $matchCount frames with pixel precision.", LogType.SUCCESS)
+                    addLog("🎯 Target '${newRule.text}' registered with '$tool'. Total active rules: ${updatedRules.size}.", LogType.SUCCESS)
                 }
             }
         } else {
@@ -934,18 +903,41 @@ class ToolsViewModel(
         updateExportedJsonState()
     }
 
+    /**
+     * Universal highlight evaluator supporting MULTIPLE simultaneous rules on the same frames.
+     * Evaluates each active rule independently and applies a +2 trailing safety hold per target
+     * so privacy blurs and highlights never leak on exit transitions.
+     */
     private fun evaluateHighlightMatches() {
         val state = _uiState.value
         val blurMap = state.directBlurs.toMutableMap()
         val accumMap = state.accumulatedDirectBlurs.toMutableMap()
 
-        // Pass 1: Collect direct OCR matches on each active frame
-        val directMatchMap = mutableMapOf<Int, List<DetectedTargetBox>>()
-        for (f in state.frames) {
-            val ocr = state.extractedOcrData[f.index]
-            if (ocr != null) {
-                val frameBoxes = mutableListOf<DetectedTargetBox>()
-                for (rule in state.activeRules) {
+        if (state.activeRules.isEmpty()) {
+            if (!state.activeRules.any { it.isZipSource }) {
+                blurMap.clear()
+            }
+            val clearedFrames = state.frames.map { it.copy(isHighlightEnabled = false) }
+            _uiState.update { it.copy(frames = clearedFrames, directBlurs = blurMap, accumulatedDirectBlurs = accumMap) }
+            updateExportedJsonState()
+            return
+        }
+
+        // Map of frameIndex -> List of all active boxes across ALL rules
+        val frameToBoxesMap = mutableMapOf<Int, MutableList<DetectedTargetBox>>()
+        val maxTrailingHoldFrames = 2
+
+        // Evaluate each active rule independently with its own trailing persistence bridge
+        for (rule in state.activeRules) {
+            var consecutiveMatchCount = 0
+            var lastConfirmedBoxes: List<DetectedTargetBox>? = null
+            var trailingHoldRemaining = 0
+
+            for (f in state.frames) {
+                val ocr = state.extractedOcrData[f.index]
+                val ruleMatchesOnFrame = mutableListOf<DetectedTargetBox>()
+
+                if (ocr != null) {
                     val matches = SpatialClusterer.findMatchingBoundingBoxes(ocr.lines, rule.text)
                     for (b in matches) {
                         if (rule.clusterCenter != null) {
@@ -955,7 +947,7 @@ class ToolsViewModel(
                             }
                         }
 
-                        frameBoxes.add(
+                        ruleMatchesOnFrame.add(
                             DetectedTargetBox(
                                 x0 = b.x0,
                                 y0 = b.y0,
@@ -969,44 +961,37 @@ class ToolsViewModel(
                         )
                     }
                 }
-                if (frameBoxes.isNotEmpty()) {
-                    directMatchMap[f.index] = frameBoxes
+
+                val finalBoxesForRule: List<DetectedTargetBox>
+                if (ruleMatchesOnFrame.isNotEmpty()) {
+                    consecutiveMatchCount++
+                    lastConfirmedBoxes = ruleMatchesOnFrame
+                    trailingHoldRemaining = maxTrailingHoldFrames
+                    finalBoxesForRule = ruleMatchesOnFrame
+                } else if (consecutiveMatchCount >= 2 && lastConfirmedBoxes != null && trailingHoldRemaining > 0) {
+                    // Confirmed sequence encountered a dropped/exit frame: hold blur for +2 frames
+                    trailingHoldRemaining--
+                    finalBoxesForRule = lastConfirmedBoxes.map { box ->
+                        box.copy(frame = f.index, time = f.timeSeconds)
+                    }
+                } else {
+                    consecutiveMatchCount = 0
+                    lastConfirmedBoxes = null
+                    trailingHoldRemaining = 0
+                    finalBoxesForRule = emptyList()
+                }
+
+                if (finalBoxesForRule.isNotEmpty()) {
+                    frameToBoxesMap.getOrPut(f.index) { mutableListOf() }.addAll(finalBoxesForRule)
                 }
             }
         }
 
-        // Pass 2: Temporal Safety Persistence Bridge (+2 Trailing Frames Hold)
-        // Eliminates single-frame OCR drops on exit transitions in Normal Mode and boundary lag in Cue Mode
-        var consecutiveMatchCount = 0
-        var lastConfirmedBoxes: List<DetectedTargetBox>? = null
-        var trailingHoldRemaining = 0
-        val maxTrailingHoldFrames = 2
-
         val updatedFrames = state.frames.map { f ->
-            val directMatches = directMatchMap[f.index]
-            val finalBoxes: List<DetectedTargetBox>
-
-            if (!directMatches.isNullOrEmpty()) {
-                consecutiveMatchCount++
-                lastConfirmedBoxes = directMatches
-                trailingHoldRemaining = maxTrailingHoldFrames
-                finalBoxes = directMatches
-            } else if (consecutiveMatchCount >= 2 && lastConfirmedBoxes != null && trailingHoldRemaining > 0) {
-                // Confirmed sequence encountered an exit transition or dropped frame: hold blur
-                trailingHoldRemaining--
-                finalBoxes = lastConfirmedBoxes!!.map { box ->
-                    box.copy(frame = f.index, time = f.timeSeconds)
-                }
-            } else {
-                consecutiveMatchCount = 0
-                lastConfirmedBoxes = null
-                trailingHoldRemaining = 0
-                finalBoxes = emptyList()
-            }
-
-            if (finalBoxes.isNotEmpty()) {
-                blurMap[f.index] = finalBoxes
-                accumMap[f.index] = finalBoxes
+            val boxesForFrame = frameToBoxesMap[f.index]
+            if (!boxesForFrame.isNullOrEmpty()) {
+                blurMap[f.index] = boxesForFrame
+                accumMap[f.index] = boxesForFrame
                 f.copy(isHighlightEnabled = true, hasMismatch = false)
             } else {
                 if (!state.activeRules.any { it.isZipSource }) {

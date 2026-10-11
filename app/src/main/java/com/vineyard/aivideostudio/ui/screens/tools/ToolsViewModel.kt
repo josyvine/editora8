@@ -526,7 +526,7 @@ class ToolsViewModel(
                         currentFrameIndex = 0,
                         isProcessing = false,
                         statusText = "${extractedList.size} Cue Frames Ready",
-                        statusColorHex = "#10b981"
+                        statusColorHex = "#10b981",
                         progressPercent = 0
                     )}
                     addLog("✅ Extracted & OCR scanned ${extractedList.size} cue frames in ~1 second.", LogType.SUCCESS)

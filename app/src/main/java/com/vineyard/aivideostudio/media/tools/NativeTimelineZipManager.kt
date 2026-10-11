@@ -14,6 +14,7 @@ import java.util.regex.Pattern
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+import kotlin.math.floor
 
 /**
  * Data model for parsed speech/transcript cues.

@@ -526,7 +526,7 @@ class ToolsViewModel(
                         currentFrameIndex = 0,
                         isProcessing = false,
                         statusText = "${extractedList.size} Cue Frames Ready",
-                        statusColorHex = "#10b981",
+                        statusColorHex = "#10b981"
                         progressPercent = 0
                     )}
                     addLog("✅ Extracted & OCR scanned ${extractedList.size} cue frames in ~1 second.", LogType.SUCCESS)
@@ -1695,41 +1695,14 @@ class ToolsViewModel(
                 val allHighlightsMap = state.accumulatedDirectBlurs.toMutableMap()
                 allHighlightsMap.putAll(state.directBlurs)
 
-                // Ensure totalVideoFrames covers all locked cue highlights, even if dialogue cue timestamps extend to the tail
+                // Ensure totalVideoFrames covers all locked cue highlights without early truncation
                 val maxHighlightFrame = (allHighlightsMap.keys.maxOrNull() ?: 0) + 1
                 val totalVideoFrames = max(if (durationSec > 0f) floor(durationSec * fps).toInt() else state.frames.size, maxHighlightFrame)
                 if (totalVideoFrames <= 0) throw IllegalStateException("Could not determine total video frame count.")
 
-                // Pre-cache missing frames using fast parallel hardware extraction to avoid slow sequential seeks
                 val workspaceDir = File(context.filesDir, "editora_frames_workspace")
                 if (!workspaceDir.exists()) {
                     workspaceDir.mkdirs()
-                }
-
-                var missingCount = 0
-                for (chk in 0 until totalVideoFrames) {
-                    if (!File(workspaceDir, "frame_$chk.jpg").exists()) {
-                        missingCount++
-                    }
-                }
-
-                // If more than 50 frames are missing from workspace, pre-extract them using the fast 10-stream extractor
-                if (missingCount > 50) {
-                    withContext(Dispatchers.Main) {
-                        _uiState.update { it.copy(renderProgressStatus = "Turbo Pre-Extracting Frames...") }
-                    }
-                    try {
-                        frameExtractor.extractFramesWithWorkers(
-                            videoUri = uri,
-                            targetFps = fps,
-                            onInitWorkers = {},
-                            onWorkerProgress = { _, _, _ -> },
-                            onTotalProgress = { cur, tot ->
-                                val pct = if (tot > 0) ((cur.toFloat() / tot.toFloat()) * 30).toInt() else 0
-                                _uiState.update { it.copy(renderPercent = pct, renderProgressStatus = "Pre-Decoding $cur/$tot frames...") }
-                            }
-                        )
-                    } catch (_: Exception) {}
                 }
 
                 val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, outWidth, outHeight).apply {
@@ -1759,10 +1732,11 @@ class ToolsViewModel(
                 val destRect = Rect(0, 0, outWidth, outHeight)
                 var lastValidFrameBitmap: Bitmap? = null
 
+                // Single fast pass: Render video directly from 0% to 100%
                 for (i in 0 until totalVideoFrames) {
                     val targetTimeUs = (i * 1_000_000L) / fps
 
-                    // Load frame: from workspace cache first, or hardware scaled retriever fallback
+                    // Load frame from workspace cache or retrieve via hardware scaler
                     val frameFile = File(workspaceDir, "frame_$i.jpg")
                     val currentBitmap = if (frameFile.exists()) {
                         BitmapFactory.decodeFile(frameFile.absolutePath)
@@ -1791,13 +1765,13 @@ class ToolsViewModel(
 
                     if (surfaceCanvas != null) {
                         try {
-                            // Draw base video frame scaled 100% to fill the encoder canvas
                             surfaceCanvas.drawBitmap(frameBitmap, null, destRect, null)
 
                             val boxes = allHighlightsMap[i] ?: emptyList()
                             for (box in boxes) {
-                                val scaleX = outWidth.toFloat() / (if (rawW > 0) rawW.toFloat() else outWidth.toFloat())
-                                val scaleY = outHeight.toFloat() / (if (rawH > 0) rawH.toFloat() else outHeight.toFloat())
+                                // Dynamic resolution-independent scaling from decoded frame dimensions to encoder canvas
+                                val scaleX = outWidth.toFloat() / frameBitmap.width.toFloat()
+                                val scaleY = outHeight.toFloat() / frameBitmap.height.toFloat()
 
                                 val bx = box.x0 * scaleX
                                 val by = box.y0 * scaleY
@@ -1824,7 +1798,7 @@ class ToolsViewModel(
                         currentBitmap.recycle()
                     }
 
-                    // Drain encoder output buffers properly setting explicit synthetic presentation timestamps (PTS)
+                    // Drain encoder output buffers properly setting synthetic PTS
                     while (true) {
                         val outIndex = encoder.dequeueOutputBuffer(bufferInfo, 2500)
                         if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
@@ -1848,7 +1822,7 @@ class ToolsViewModel(
                         }
                     }
 
-                    val pct = 30 + (((i + 1).toFloat() / totalVideoFrames.toFloat()) * 70).toInt()
+                    val pct = (((i + 1).toFloat() / totalVideoFrames.toFloat()) * 100).toInt()
                     _uiState.update { it.copy(
                         renderPercent = pct.coerceIn(0, 100),
                         renderProgressStatus = "Burning frame ${i + 1}/$totalVideoFrames (${allHighlightsMap.size} active highlight frames)..."

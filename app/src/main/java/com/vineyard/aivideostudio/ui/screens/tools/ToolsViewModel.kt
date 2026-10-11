@@ -65,6 +65,8 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.hypot
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sin
 
 enum class LogType { INFO, SUCCESS, WARNING, ERROR, NET }
@@ -610,6 +612,7 @@ class ToolsViewModel(
 
         val state = _uiState.value
         if (state.studioMode == "Cue") {
+            // In Cue mode, do not trigger the SlotCaptureDialog popup modal
             _uiState.update { it.copy(isPlaying = false) }
             return
         }
@@ -1687,12 +1690,47 @@ class ToolsViewModel(
                 val bitRate = 4_000_000
 
                 val durationSec = durationMs / 1000f
-                val totalVideoFrames = if (durationSec > 0f) floor(durationSec * fps).toInt() else state.frames.size
-                if (totalVideoFrames <= 0) throw IllegalStateException("Could not determine total video frame count.")
 
                 // Combine all direct blurs and accumulated cue highlights across the entire video
                 val allHighlightsMap = state.accumulatedDirectBlurs.toMutableMap()
                 allHighlightsMap.putAll(state.directBlurs)
+
+                // Ensure totalVideoFrames covers all locked cue highlights, even if dialogue cue timestamps extend to the tail
+                val maxHighlightFrame = (allHighlightsMap.keys.maxOrNull() ?: 0) + 1
+                val totalVideoFrames = max(if (durationSec > 0f) floor(durationSec * fps).toInt() else state.frames.size, maxHighlightFrame)
+                if (totalVideoFrames <= 0) throw IllegalStateException("Could not determine total video frame count.")
+
+                // Pre-cache missing frames using fast parallel hardware extraction to avoid slow sequential seeks
+                val workspaceDir = File(context.filesDir, "editora_frames_workspace")
+                if (!workspaceDir.exists()) {
+                    workspaceDir.mkdirs()
+                }
+
+                var missingCount = 0
+                for (chk in 0 until totalVideoFrames) {
+                    if (!File(workspaceDir, "frame_$chk.jpg").exists()) {
+                        missingCount++
+                    }
+                }
+
+                // If more than 50 frames are missing from workspace, pre-extract them using the fast 10-stream extractor
+                if (missingCount > 50) {
+                    withContext(Dispatchers.Main) {
+                        _uiState.update { it.copy(renderProgressStatus = "Turbo Pre-Extracting Frames...") }
+                    }
+                    try {
+                        frameExtractor.extractFramesWithWorkers(
+                            videoUri = uri,
+                            targetFps = fps,
+                            onInitWorkers = {},
+                            onWorkerProgress = { _, _, _ -> },
+                            onTotalProgress = { cur, tot ->
+                                val pct = if (tot > 0) ((cur.toFloat() / tot.toFloat()) * 30).toInt() else 0
+                                _uiState.update { it.copy(renderPercent = pct, renderProgressStatus = "Pre-Decoding $cur/$tot frames...") }
+                            }
+                        )
+                    } catch (_: Exception) {}
+                }
 
                 val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, outWidth, outHeight).apply {
                     setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
@@ -1714,7 +1752,6 @@ class ToolsViewModel(
                 val bufferInfo = MediaCodec.BufferInfo()
                 var encodedFrameCount = 0L
 
-                val workspaceDir = File(context.filesDir, "editora_frames_workspace")
                 streamRetriever = MediaMetadataRetriever().apply {
                     setDataSource(context, uri)
                 }
@@ -1725,13 +1762,18 @@ class ToolsViewModel(
                 for (i in 0 until totalVideoFrames) {
                     val targetTimeUs = (i * 1_000_000L) / fps
 
-                    // Load frame: from workspace cache if available, or decode from stream
+                    // Load frame: from workspace cache first, or hardware scaled retriever fallback
                     val frameFile = File(workspaceDir, "frame_$i.jpg")
                     val currentBitmap = if (frameFile.exists()) {
                         BitmapFactory.decodeFile(frameFile.absolutePath)
                     } else {
-                        streamRetriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                            ?: streamRetriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && outWidth > 0 && outHeight > 0) {
+                            streamRetriever.getScaledFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, outWidth, outHeight)
+                                ?: streamRetriever.getScaledFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST, outWidth, outHeight)
+                                ?: streamRetriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                        } else {
+                            streamRetriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                        }
                     }
 
                     if (currentBitmap != null) {
@@ -1806,9 +1848,9 @@ class ToolsViewModel(
                         }
                     }
 
-                    val pct = (((i + 1).toFloat() / totalVideoFrames.toFloat()) * 100).toInt()
+                    val pct = 30 + (((i + 1).toFloat() / totalVideoFrames.toFloat()) * 70).toInt()
                     _uiState.update { it.copy(
-                        renderPercent = pct,
+                        renderPercent = pct.coerceIn(0, 100),
                         renderProgressStatus = "Burning frame ${i + 1}/$totalVideoFrames (${allHighlightsMap.size} active highlight frames)..."
                     )}
                     updateBackgroundKeepAlive(i + 1, totalVideoFrames)

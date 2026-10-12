@@ -716,47 +716,24 @@ class ToolsViewModel(
         }
     }
 
-    /**
-     * Fast Slot Scanning:
-     * If frames within the captured slot are not yet in memory, fast-extracts ONLY that
-     * exact frame range using hardware seeking in seconds (mirroring Cue Mode speed)
-     * instead of requiring a 3-minute full video extraction.
-     */
     fun scanCapturedSlot() {
         val state = _uiState.value
-        val uri = state.videoUri ?: return
         val start = state.slotStartFrame ?: 0
         val end = state.slotEndFrame ?: 0
         val minF = minOf(start, end)
         val maxF = maxOf(start, end)
-        val targetFrameCount = maxF - minF + 1
         
-        if (targetFrameCount <= 0) return
+        val framesToScan = state.frames.filter { it.index in minF..maxF }
+        if (framesToScan.isEmpty()) return
 
         _uiState.update { it.copy(isProcessing = true, statusText = "Ultra-Fast OCR...", statusColorHex = "#eab308", slotStep = 0) }
-        addLog("🚀 Initiating parallel native OCR scan on $targetFrameCount frames...", LogType.INFO)
+        addLog("🚀 Initiating parallel native OCR scan on ${framesToScan.size} frames...", LogType.INFO)
         startBackgroundKeepAlive("Running OCR on captured frames...")
 
         viewModelScope.launch(Dispatchers.Default) {
             try {
-                // If frames already exist in state.frames use them; otherwise fast-extract ONLY this selective slot
-                var framesToScan = state.frames.filter { it.index in minF..maxF }
-                if (framesToScan.isEmpty()) {
-                    addLog("⚡ Fast-extracting slot range (Fr $minF - $maxF)...", LogType.INFO)
-                    framesToScan = frameExtractor.extractFrameRange(
-                        videoUri = uri,
-                        startFrame = minF,
-                        endFrame = maxF,
-                        targetFps = state.targetFps,
-                        onProgress = { current, total ->
-                            val pct = if (total > 0) ((current.toFloat() / total.toFloat()) * 50).toInt() else 0
-                            _uiState.update { it.copy(statusText = "Extracting $current/$total", progressPercent = pct) }
-                        }
-                    )
-                }
-
                 val batchResults = ocrEngine.scanBatch(framesToScan, roiMask = null, parallelWorkers = 5) { current, total ->
-                    val pct = 50 + ((current.toFloat() / total.toFloat()) * 50).toInt()
+                    val pct = ((current.toFloat() / total.toFloat()) * 100).toInt()
                     _uiState.update { it.copy(
                         statusText = "OCR: $current/$total",
                         progressPercent = pct
@@ -768,16 +745,14 @@ class ToolsViewModel(
                 updatedMap.putAll(batchResults)
 
                 withContext(Dispatchers.Main) {
-                    val mergedFrames = (state.frames + framesToScan).distinctBy { it.index }.sortedBy { it.index }
                     _uiState.update { it.copy(
-                        frames = mergedFrames,
                         extractedOcrData = updatedMap,
                         isProcessing = false,
                         progressPercent = 0,
                         statusText = "Scanned ${framesToScan.size} Frames",
                         statusColorHex = "#10b981"
                     )}
-                    addLog("✅ Ultra-Fast OCR completed successfully on ${framesToScan.size} frames.", LogType.SUCCESS)
+                    addLog("✅ Ultra-Fast OCR completed successfully.", LogType.SUCCESS)
                     stopBackgroundKeepAlive()
                     evaluateHighlightMatches()
                     updateExportedJsonState()
@@ -1720,34 +1695,12 @@ class ToolsViewModel(
                 val allHighlightsMap = state.accumulatedDirectBlurs.toMutableMap()
                 allHighlightsMap.putAll(state.directBlurs)
 
-                // Video duration is strictly bound to original video length
+                // Video duration is strictly bound to original video length (prevents stretching to 5:48)
                 val totalVideoFrames = max(1, if (durationSec > 0f) floor(durationSec * fps).toInt() else state.frames.size)
 
                 val workspaceDir = File(context.filesDir, "editora_frames_workspace")
                 if (!workspaceDir.exists()) {
                     workspaceDir.mkdirs()
-                }
-
-                // SPEED OPTIMIZATION: Ensure full video frames exist in workspace cache.
-                // If selective cue mode left frames un-extracted, fast-decode the entire timeline with 
-                // the turbo hardware extractor in seconds, avoiding slow MediaMetadataRetriever stalls.
-                val hasMissingWorkspaceFrames = (0 until totalVideoFrames).any { !File(workspaceDir, "frame_$it.jpg").exists() }
-                if (hasMissingWorkspaceFrames) {
-                    addLog("⚡ Turbo hardware extraction for full video timeline before burning...", LogType.INFO)
-                    _uiState.update { it.copy(renderProgressStatus = "Preparing hardware video frames...") }
-                    frameExtractor.extractFramesWithWorkers(
-                        videoUri = uri,
-                        targetFps = fps,
-                        onInitWorkers = {},
-                        onWorkerProgress = { _, _, _ -> },
-                        onTotalProgress = { cur, tot ->
-                            val pct = if (tot > 0) ((cur.toFloat() / tot.toFloat()) * 20).toInt() else 0
-                            _uiState.update { it.copy(
-                                renderPercent = pct,
-                                renderProgressStatus = "Hardware Decoding $cur/$tot ($pct%)"
-                            )}
-                        }
-                    )
                 }
 
                 val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, outWidth, outHeight).apply {
@@ -1777,18 +1730,14 @@ class ToolsViewModel(
                 val destRect = Rect(0, 0, outWidth, outHeight)
                 var lastValidFrameBitmap: Bitmap? = null
 
-                val decodeOptions = BitmapFactory.Options().apply {
-                    inPreferredConfig = Bitmap.Config.RGB_565
-                }
-
-                // Single fast pass: Render video directly with hardware acceleration
+                // Single fast pass: Render video directly from 0% to 100%
                 for (i in 0 until totalVideoFrames) {
                     val targetTimeUs = (i * 1_000_000L) / fps
 
-                    // Load frame from high-speed workspace cache first, or hardware scaled retriever fallback
+                    // Load frame from workspace cache first, or hardware scaled retriever fallback
                     val frameFile = File(workspaceDir, "frame_$i.jpg")
                     val currentBitmap = if (frameFile.exists()) {
-                        BitmapFactory.decodeFile(frameFile.absolutePath, decodeOptions)
+                        BitmapFactory.decodeFile(frameFile.absolutePath)
                     } else {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && outWidth > 0 && outHeight > 0) {
                             streamRetriever.getScaledFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, outWidth, outHeight)
@@ -1850,7 +1799,7 @@ class ToolsViewModel(
 
                     // Drain encoder output buffers properly setting synthetic PTS
                     while (true) {
-                        val outIndex = encoder.dequeueOutputBuffer(bufferInfo, 2500)
+                        val outIndex = encoder.dequeueOutputBuffer(bufferInfo, 0)
                         if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                             if (!muxerStarted) {
                                 videoTrackIndex = videoMuxer.addTrack(encoder.outputFormat)
@@ -1872,7 +1821,7 @@ class ToolsViewModel(
                         }
                     }
 
-                    val pct = 20 + (((i + 1).toFloat() / totalVideoFrames.toFloat()) * 80).toInt()
+                    val pct = (((i + 1).toFloat() / totalVideoFrames.toFloat()) * 100).toInt()
                     _uiState.update { it.copy(
                         renderPercent = pct.coerceIn(0, 100),
                         renderProgressStatus = "Burning frame ${i + 1}/$totalVideoFrames (${allHighlightsMap.size} active highlight frames)..."
